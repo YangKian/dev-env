@@ -1,1 +1,1 @@
-pub mod body;
+pub mod proto;

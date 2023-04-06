@@ -1,13 +1,12 @@
 use clap::Parser;
 use serde_json;
-use std::io::{BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
-use std::thread;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::process::Stdio;
+use tokio::io::{copy, AsyncBufReadExt, AsyncReadExt, BufReader, BufWriter};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use dev_env::body::Project;
+use dev_env::proto::Project;
 
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -19,7 +18,8 @@ pub struct ServerConfig {
     log_level: String,
 }
 
-fn main() -> Result<(), std::io::Error> {
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -31,13 +31,13 @@ fn main() -> Result<(), std::io::Error> {
     let cli = ServerConfig::parse();
     println!("server config: {cli:?}");
 
-    let listener = TcpListener::bind(&format!("{}:{}", cli.host, cli.port))?;
+    let listener = TcpListener::bind(&format!("{}:{}", cli.host, cli.port)).await?;
 
     loop {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
 
         let mut buf = vec![0; 1024];
-        let n = socket.read(&mut buf).unwrap();
+        let n = socket.read(&mut buf).await.unwrap();
         if n == 0 {
             println!("read 0 bytes");
             continue;
@@ -45,8 +45,8 @@ fn main() -> Result<(), std::io::Error> {
 
         match serde_json::from_slice::<Project>(&buf[..n]) {
             Ok(project) => {
-                thread::spawn(move || {
-                    if let Err(e) = run_project(socket, project) {
+                tokio::spawn(async move {
+                    if let Err(e) = run_project(socket, project).await {
                         eprintln!("failed to run project, error: {e:?}");
                         return;
                     }
@@ -60,7 +60,7 @@ fn main() -> Result<(), std::io::Error> {
     }
 }
 
-fn run_project(mut stream: TcpStream, project: Project) -> Result<(), std::io::Error> {
+async fn run_project(stream: TcpStream, project: Project) -> Result<(), tokio::io::Error> {
     println!("receive init request, project: {project:?}");
     let mut child = Command::new(project.command)
         .args(project.args)
@@ -72,57 +72,44 @@ fn run_project(mut stream: TcpStream, project: Project) -> Result<(), std::io::E
         .expect("failed to spawn child");
     println!("spawned child successfully");
 
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
 
-    let mut reader = stream.try_clone().unwrap();
-    let mut writer = stream.try_clone().unwrap();
+    let (mut reader, mut writer) = stream.into_split();
 
-    let t3 = thread::spawn(move || -> Result<(), std::io::Error> {
-        let mut buf = vec![0; 4 * 1024];
-        let mut r = BufReader::new(stderr);
-        loop {
-            let n = r.read(&mut buf)?;
-            if n != 0 {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                eprintln!("get {n} bytes from stderr: {msg}");
-            }
+    let log_stream = tokio::spawn(async move {
+        let mut r = BufReader::new(stderr).lines();
+        while let Some(line_result) = r.next_line().await? {
+            eprintln!("[lsp info]: {}", line_result);
         }
+        println!("log_stream finished");
+        Ok::<(), tokio::io::Error>(())
     });
 
-    let t2 = thread::spawn(move || -> Result<(), std::io::Error> {
-        let mut buf = vec![0; 4 * 1024];
-        let mut r = BufReader::new(stdout);
-        loop {
-            let n = r.read(&mut buf)?;
-            if n != 0 {
-                // let s = String::from_utf8_lossy(&buf[..n]);
-                // println!("read {n} bytes from lsp: {s}");
-                writer.write_all(&buf[..n]).unwrap();
-                writer.flush().unwrap();
-            }
+    // forward lsp server response to lsp client
+    let output_stream = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        if let Err(e) = copy(&mut reader, &mut writer).await {
+            eprintln!("Output stream err: {}", e);
         }
-        println!("t2 finished");
-        Ok(())
+        println!("output_stream finished");
+        Ok::<(), tokio::io::Error>(())
     });
 
-    let t1 = thread::spawn(move || -> Result<(), std::io::Error> {
-        let mut buf = vec![0; 4 * 1024];
-        let mut r = BufReader::new(reader.try_clone().unwrap());
-        loop {
-            let n = r.read(&mut buf)?;
-            if n != 0 {
-                // let s = String::from_utf8_lossy(&buf[..n]);
-                stdin.write_all(&buf[..n]).unwrap();
-                stdin.flush().unwrap();
-            }
+    // forward lsp client request to lsp server
+    let input_stream = tokio::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut writer = BufWriter::new(stdin);
+        if let Err(e) = copy(&mut reader, &mut writer).await {
+            eprintln!("Input stream err: {}", e);
         }
-        println!("t1 finished");
-        Ok(())
+        println!("input_stream finished");
+        Ok::<(), tokio::io::Error>(())
     });
 
-    match child.wait() {
+    tokio::join!(input_stream, output_stream, log_stream);
+    match child.wait().await {
         Ok(status) => {
             println!("child exited with status: {status}");
         }
@@ -130,10 +117,5 @@ fn run_project(mut stream: TcpStream, project: Project) -> Result<(), std::io::E
             eprintln!("failed to wait on child, error: {e:?}");
         }
     }
-
-    t1.join().unwrap();
-    t2.join().unwrap();
-    t3.join().unwrap();
-    Ok(())
-    // thread::join!(t1, t2, t3);
+    Ok::<(), tokio::io::Error>(())
 }
