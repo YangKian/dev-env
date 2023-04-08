@@ -7,6 +7,10 @@ edition = "2021"
 name = "lsp-server"
 path = "bin/lsp-server.rs"
 
+[[bin]]
+name = "lsp-client"
+path = "bin/lsp-client.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -14,7 +18,9 @@ axum = "0.6"
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 tracing-log = "0.1"
+tracing-appender = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tokio = { version = "1.27", features = ["full"]}
 clap = { version = "4.2", features = ["derive", "env"] }
